@@ -8,6 +8,9 @@ multiple subjects.
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import numpy as np
 
 from src.features import extract_features
@@ -32,6 +35,9 @@ TEST_SIZE = 0.25
 SVM_EPOCHS = 3000
 SVM_LEARNING_RATE = 0.001
 SVM_REGULARIZATION = 0.01
+RESULTS_DIR = Path("results")
+CONFUSION_MATRIX_FIGURE_PATH = RESULTS_DIR / "baseline_s01_confusion_matrix.png"
+CLASS_DISTRIBUTION_FIGURE_PATH = RESULTS_DIR / "baseline_s01_class_distribution.png"
 
 
 try:
@@ -321,6 +327,85 @@ def print_baseline_report(
     print(metrics["confusion_matrix"])
 
 
+def save_confusion_matrix_plot(
+    confusion_matrix_values: np.ndarray,
+    output_path: Path = CONFUSION_MATRIX_FIGURE_PATH,
+) -> Path:
+    """Save a confusion matrix figure for baseline result presentation."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, axis = plt.subplots(figsize=(5, 4))
+    image = axis.imshow(confusion_matrix_values, cmap="Blues")
+    fig.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+
+    class_names = ["negative", "positive"]
+    axis.set_xticks(np.arange(len(class_names)), labels=class_names)
+    axis.set_yticks(np.arange(len(class_names)), labels=class_names)
+    axis.set_xlabel("Predicted label")
+    axis.set_ylabel("True label")
+    axis.set_title("SVM Baseline Confusion Matrix, s01")
+
+    for row_index in range(confusion_matrix_values.shape[0]):
+        for col_index in range(confusion_matrix_values.shape[1]):
+            axis.text(
+                col_index,
+                row_index,
+                int(confusion_matrix_values[row_index, col_index]),
+                ha="center",
+                va="center",
+                color="black",
+            )
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def save_class_distribution_plot(
+    labels: np.ndarray,
+    output_path: Path = CLASS_DISTRIBUTION_FIGURE_PATH,
+) -> Path:
+    """Save a positive/negative sample-count bar chart."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    negative_count = int(np.sum(labels == NEGATIVE_LABEL))
+    positive_count = int(np.sum(labels == POSITIVE_LABEL))
+
+    fig, axis = plt.subplots(figsize=(5, 4))
+    bars = axis.bar(
+        ["negative", "positive"],
+        [negative_count, positive_count],
+        color=["#4C78A8", "#F58518"],
+    )
+    axis.set_xlabel("Class")
+    axis.set_ylabel("Number of samples")
+    axis.set_title("Valence Label Distribution, s01")
+
+    for bar in bars:
+        height = bar.get_height()
+        axis.text(
+            bar.get_x() + bar.get_width() / 2,
+            height,
+            str(int(height)),
+            ha="center",
+            va="bottom",
+        )
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def save_baseline_figures(labels: np.ndarray, metrics: dict) -> list[Path]:
+    """Save baseline visualizations without changing experiment logic."""
+    return [
+        save_confusion_matrix_plot(metrics["confusion_matrix"]),
+        save_class_distribution_plot(labels),
+    ]
+
+
 def main() -> None:
     """Run the minimal single-subject SVM baseline."""
     set_random_seed(42)
@@ -328,6 +413,9 @@ def main() -> None:
     features, labels = build_single_subject_feature_matrix(subject_id)
     metrics = train_and_evaluate_svm(features, labels)
     print_baseline_report(features, labels, metrics, subject_id)
+    figure_paths = save_baseline_figures(labels, metrics)
+    for figure_path in figure_paths:
+        print(f"saved figure: {figure_path}")
 
 
 if __name__ == "__main__":
