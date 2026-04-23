@@ -1,16 +1,14 @@
-"""Minimal SVM baseline for single-subject DEAP valence classification.
+"""SVM baseline for DEAP valence classification.
 
-This script is intentionally small and course-demo oriented. It uses one
-subject's 40 trials only, so the result is a pipeline sanity check rather than
-a strong experimental conclusion. The next step can extend this baseline to
-multiple subjects.
+This script is course-assignment oriented. The main entry runs a small
+multi-subject baseline on s01-s05 with 5-fold StratifiedKFold evaluation.
 """
 
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 from src.features import extract_features
@@ -30,14 +28,17 @@ POSITIVE_LABEL = 1
 NEGATIVE_LABEL = 0
 VALENCE_THRESHOLD = 5.0
 DEFAULT_SUBJECT_ID = 1
+MULTI_SUBJECT_IDS = (1, 2, 3, 4, 5)
 RANDOM_STATE = 42
 TEST_SIZE = 0.25
+N_SPLITS = 5
 SVM_EPOCHS = 3000
 SVM_LEARNING_RATE = 0.001
 SVM_REGULARIZATION = 0.01
 RESULTS_DIR = Path("results")
 CONFUSION_MATRIX_FIGURE_PATH = RESULTS_DIR / "baseline_s01_confusion_matrix.png"
 CLASS_DISTRIBUTION_FIGURE_PATH = RESULTS_DIR / "baseline_s01_class_distribution.png"
+MULTISUBJECT_METRICS_CSV_PATH = RESULTS_DIR / "baseline_multisubject_metrics.csv"
 
 
 try:
@@ -48,7 +49,7 @@ try:
         precision_score,
         recall_score,
     )
-    from sklearn.model_selection import train_test_split
+    from sklearn.model_selection import StratifiedKFold, train_test_split
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
     from sklearn.svm import SVC
@@ -99,6 +100,139 @@ def build_single_subject_feature_matrix(
         )
 
     return features, labels
+
+
+def build_multi_subject_feature_matrix(
+    subject_ids: tuple[int, ...] = MULTI_SUBJECT_IDS,
+) -> tuple[np.ndarray, np.ndarray, dict[int, int]]:
+    """Build a combined X/y matrix from multiple DEAP subjects.
+
+    Each subject follows the existing project pipeline:
+    original BDF -> preprocessing -> baseline-corrected stimulus -> feature
+    extraction -> valence binary labels.
+    """
+    feature_blocks = []
+    label_blocks = []
+    subject_sample_counts = {}
+
+    for subject_id in subject_ids:
+        print(f"building features for s{subject_id:02d}...")
+        features, labels = build_single_subject_feature_matrix(subject_id)
+        feature_blocks.append(features)
+        label_blocks.append(labels)
+        subject_sample_counts[subject_id] = len(labels)
+
+    return (
+        np.vstack(feature_blocks),
+        np.concatenate(label_blocks),
+        subject_sample_counts,
+    )
+
+
+def create_sklearn_svm_pipeline() -> Pipeline:
+    """Create the fixed course-baseline model."""
+    return Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            ("svm", SVC(kernel="rbf", C=1.0, gamma="scale")),
+        ]
+    )
+
+
+def evaluate_multisubject_stratified_kfold(
+    features: np.ndarray,
+    labels: np.ndarray,
+    n_splits: int = N_SPLITS,
+    random_state: int = RANDOM_STATE,
+) -> list[dict]:
+    """Evaluate the multi-subject baseline with StratifiedKFold."""
+    if not SKLEARN_AVAILABLE:
+        raise ImportError(
+            "The multi-subject baseline requires scikit-learn for "
+            "StratifiedKFold and sklearn.svm.SVC."
+        )
+
+    splitter = StratifiedKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=random_state,
+    )
+    fold_metrics = []
+
+    for fold_index, (train_indices, test_indices) in enumerate(
+        splitter.split(features, labels),
+        start=1,
+    ):
+        classifier = create_sklearn_svm_pipeline()
+        classifier.fit(features[train_indices], labels[train_indices])
+        predictions = classifier.predict(features[test_indices])
+
+        fold_metrics.append(
+            {
+                "fold": fold_index,
+                "train_size": len(train_indices),
+                "test_size": len(test_indices),
+                "accuracy": accuracy_score(labels[test_indices], predictions),
+                "precision": precision_score(
+                    labels[test_indices],
+                    predictions,
+                    zero_division=0,
+                ),
+                "recall": recall_score(
+                    labels[test_indices],
+                    predictions,
+                    zero_division=0,
+                ),
+                "f1": f1_score(labels[test_indices], predictions, zero_division=0),
+            }
+        )
+
+    return fold_metrics
+
+
+def summarize_fold_metrics(fold_metrics: list[dict]) -> dict:
+    """Compute average accuracy, precision, recall, and F1."""
+    metric_names = ["accuracy", "precision", "recall", "f1"]
+    return {
+        metric_name: float(
+            np.mean([fold_result[metric_name] for fold_result in fold_metrics])
+        )
+        for metric_name in metric_names
+    }
+
+
+def save_multisubject_metrics_csv(
+    fold_metrics: list[dict],
+    average_metrics: dict,
+    output_path: Path = MULTISUBJECT_METRICS_CSV_PATH,
+) -> Path:
+    """Save fold-level and average metrics to results/."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "fold",
+        "train_size",
+        "test_size",
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+    ]
+
+    with output_path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for fold_result in fold_metrics:
+            writer.writerow(fold_result)
+        writer.writerow(
+            {
+                "fold": "mean",
+                "train_size": "",
+                "test_size": "",
+                **average_metrics,
+            }
+        )
+
+    return output_path
 
 
 def train_and_evaluate_svm(
@@ -332,6 +466,8 @@ def save_confusion_matrix_plot(
     output_path: Path = CONFUSION_MATRIX_FIGURE_PATH,
 ) -> Path:
     """Save a confusion matrix figure for baseline result presentation."""
+    import matplotlib.pyplot as plt
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     fig, axis = plt.subplots(figsize=(5, 4))
@@ -367,6 +503,8 @@ def save_class_distribution_plot(
     output_path: Path = CLASS_DISTRIBUTION_FIGURE_PATH,
 ) -> Path:
     """Save a positive/negative sample-count bar chart."""
+    import matplotlib.pyplot as plt
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     negative_count = int(np.sum(labels == NEGATIVE_LABEL))
@@ -406,16 +544,66 @@ def save_baseline_figures(labels: np.ndarray, metrics: dict) -> list[Path]:
     ]
 
 
+def print_multisubject_baseline_report(
+    features: np.ndarray,
+    labels: np.ndarray,
+    subject_sample_counts: dict[int, int],
+    fold_metrics: list[dict],
+    average_metrics: dict,
+    csv_path: Path,
+) -> None:
+    """Print the course-oriented multi-subject baseline report."""
+    positive_count = int(np.sum(labels == POSITIVE_LABEL))
+    negative_count = int(np.sum(labels == NEGATIVE_LABEL))
+
+    print("DEAP multi-subject SVM baseline")
+    print("note: this is a course-assignment oriented multi-subject baseline.")
+    print("subjects: s01-s05")
+    print("model: StandardScaler + sklearn.svm.SVC(kernel='rbf', C=1.0, gamma='scale')")
+    print("evaluation: 5-fold StratifiedKFold")
+    print(f"total samples: {features.shape[0]}")
+    print(f"feature dimension: {features.shape[1]}")
+    print("samples per subject:")
+    for subject_id, sample_count in subject_sample_counts.items():
+        print(f"  s{subject_id:02d}: {sample_count}")
+    print(f"positive samples: {positive_count}")
+    print(f"negative samples: {negative_count}")
+    print()
+    print("fold | train | test | accuracy | precision | recall | F1")
+    for fold_result in fold_metrics:
+        print(
+            f"{fold_result['fold']:>4} | "
+            f"{fold_result['train_size']:>5} | "
+            f"{fold_result['test_size']:>4} | "
+            f"{fold_result['accuracy']:.4f} | "
+            f"{fold_result['precision']:.4f} | "
+            f"{fold_result['recall']:.4f} | "
+            f"{fold_result['f1']:.4f}"
+        )
+    print()
+    print("average metrics:")
+    print(f"accuracy: {average_metrics['accuracy']:.4f}")
+    print(f"precision: {average_metrics['precision']:.4f}")
+    print(f"recall: {average_metrics['recall']:.4f}")
+    print(f"F1: {average_metrics['f1']:.4f}")
+    print(f"saved metrics CSV: {csv_path}")
+
+
 def main() -> None:
-    """Run the minimal single-subject SVM baseline."""
+    """Run the s01-s05 multi-subject SVM baseline."""
     set_random_seed(42)
-    subject_id = DEFAULT_SUBJECT_ID
-    features, labels = build_single_subject_feature_matrix(subject_id)
-    metrics = train_and_evaluate_svm(features, labels)
-    print_baseline_report(features, labels, metrics, subject_id)
-    figure_paths = save_baseline_figures(labels, metrics)
-    for figure_path in figure_paths:
-        print(f"saved figure: {figure_path}")
+    features, labels, subject_sample_counts = build_multi_subject_feature_matrix()
+    fold_metrics = evaluate_multisubject_stratified_kfold(features, labels)
+    average_metrics = summarize_fold_metrics(fold_metrics)
+    csv_path = save_multisubject_metrics_csv(fold_metrics, average_metrics)
+    print_multisubject_baseline_report(
+        features,
+        labels,
+        subject_sample_counts,
+        fold_metrics,
+        average_metrics,
+        csv_path,
+    )
 
 
 if __name__ == "__main__":
