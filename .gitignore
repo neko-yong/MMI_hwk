@@ -5,3 +5,7 @@ data/
 results/
 __pycache__/
 *.pyc
+# DEAP official preprocessed data
+*.dat
+data/DEAP/preprocessed/
+archive/
