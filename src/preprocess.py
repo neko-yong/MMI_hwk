@@ -1,13 +1,15 @@
-"""Minimal DEAP raw data inspection utilities.
+"""DEAP raw BDF preprocessing utilities for the EEG course project.
 
-This module intentionally does not perform filtering, artifact removal,
-segmentation, feature extraction, or modeling. It only checks whether the raw
-DEAP BDF files and metadata CSV files can be read and understood.
+The task-1 pipeline is:
+load raw BDF -> recover trial boundaries -> cut baseline/stimulus trials ->
+fix trial length -> bandpass + notch filtering -> optional ICA -> baseline
+correction. Feature extraction and modeling live in other modules.
 """
 
 from __future__ import annotations
 
 import csv
+import os
 from array import array
 from collections import Counter
 from pathlib import Path
@@ -38,6 +40,9 @@ BANDPASS_HIGH_HZ = 45.0
 BANDPASS_ORDER = 4
 NOTCH_FREQ_HZ = 50.0
 NOTCH_QUALITY_FACTOR = 30.0
+DEFAULT_ICA_COMPONENTS = 16
+DEFAULT_ICA_RANDOM_STATE = 42
+PREPROCESSING_RESULTS_DIR = Path("results/preprocessing")
 
 
 def preprocess_eeg(eeg_data):
@@ -100,6 +105,26 @@ def read_bdf_header(bdf_path: str | Path) -> dict:
         "samples_per_record": samples_per_record,
         "sampling_rates": sampling_rates,
         "total_samples_per_channel": num_records * samples_per_record[0],
+    }
+
+
+def load_bdf_subject(
+    subject_id: int = 1,
+    original_dir: str | Path = DEFAULT_ORIGINAL_DIR,
+) -> dict:
+    """Load lightweight metadata for one DEAP raw BDF subject.
+
+    This does not load all EEG samples. The heavy signal read happens later
+    when trial intervals are known.
+    """
+    bdf_path = PROJECT_ROOT / Path(original_dir) / f"s{subject_id:02d}.bdf"
+    header = read_bdf_header(bdf_path)
+    return {
+        "subject_id": subject_id,
+        "bdf_path": bdf_path,
+        "header": header,
+        "sampling_rate": header["sampling_rates"][0],
+        "eeg_channel_labels": header["channel_labels"][:EEG_CHANNEL_COUNT],
     }
 
 
@@ -252,6 +277,20 @@ def get_trial_boundaries_from_bdf(bdf_path: str | Path) -> list[dict]:
     """
     event_info = extract_status_events(bdf_path)
     return infer_trial_boundaries(event_info["events"])
+
+
+def extract_trials_from_status(bdf_path: str | Path) -> dict:
+    """Extract DEAP trial boundaries from Status codes 3/4/5.
+
+    code 3 = baseline start, code 4 = stimulus start, code 5 = stimulus end.
+    The returned boundaries define baseline=[3,4) and stimulus=[4,5).
+    """
+    event_info = extract_status_events(bdf_path)
+    boundaries = infer_trial_boundaries(event_info["events"])
+    return {
+        "event_info": event_info,
+        "boundaries": boundaries,
+    }
 
 
 def _read_eeg_interval(
@@ -490,6 +529,19 @@ def standardize_raw_eeg_trial_lengths(
     }
 
 
+def fix_trial_length(
+    extracted: dict,
+    baseline_samples: int = TARGET_BASELINE_SAMPLES,
+    stimulus_samples: int = TARGET_STIMULUS_SAMPLES,
+) -> dict:
+    """Public wrapper for fixed-length DEAP trial organization."""
+    return standardize_raw_eeg_trial_lengths(
+        extracted,
+        baseline_samples=baseline_samples,
+        stimulus_samples=stimulus_samples,
+    )
+
+
 def _require_signal_processing_dependencies():
     """Import NumPy/SciPy only when the preprocessing chain is requested."""
     try:
@@ -552,32 +604,170 @@ def notch_filter_eeg(
     return filtfilt(b, a, eeg_data, axis=-1).astype("float32")
 
 
-def baseline_correct_stimulus(filtered_baseline, filtered_stimulus):
+def bandpass_and_notch_filter(
+    baseline_data,
+    stimulus_data,
+    sampling_rate: float = DEAP_SAMPLING_RATE,
+    low_hz: float = BANDPASS_LOW_HZ,
+    high_hz: float = BANDPASS_HIGH_HZ,
+    bandpass_order: int = BANDPASS_ORDER,
+    notch_hz: float = NOTCH_FREQ_HZ,
+    notch_quality_factor: float = NOTCH_QUALITY_FACTOR,
+) -> dict:
+    """Apply 4-45 Hz bandpass and 50 Hz notch filtering to EEG trials."""
+    bandpassed_baseline = bandpass_filter_eeg(
+        baseline_data,
+        sampling_rate=sampling_rate,
+        low_hz=low_hz,
+        high_hz=high_hz,
+        order=bandpass_order,
+    )
+    bandpassed_stimulus = bandpass_filter_eeg(
+        stimulus_data,
+        sampling_rate=sampling_rate,
+        low_hz=low_hz,
+        high_hz=high_hz,
+        order=bandpass_order,
+    )
+    filtered_baseline = notch_filter_eeg(
+        bandpassed_baseline,
+        sampling_rate=sampling_rate,
+        notch_hz=notch_hz,
+        quality_factor=notch_quality_factor,
+    )
+    filtered_stimulus = notch_filter_eeg(
+        bandpassed_stimulus,
+        sampling_rate=sampling_rate,
+        notch_hz=notch_hz,
+        quality_factor=notch_quality_factor,
+    )
+    return {
+        "filtered_baseline": filtered_baseline,
+        "filtered_stimulus": filtered_stimulus,
+    }
+
+
+def run_ica_artifact_removal(
+    baseline_data,
+    stimulus_data,
+    enable_ica: bool = False,
+    n_components: int | None = DEFAULT_ICA_COMPONENTS,
+    random_state: int = DEFAULT_ICA_RANDOM_STATE,
+    exclude_components: list[int] | tuple[int, ...] | None = None,
+) -> dict:
+    """Optionally remove manually selected ICA components from EEG trials.
+
+    Automatic artifact detection is intentionally not forced here because this
+    project does not include EOG labels. For stable course demos, pass manual
+    component IDs through exclude_components, or leave ICA disabled.
+    """
+    np, _, _, _, _ = _require_signal_processing_dependencies()
+    excluded = list(exclude_components or [])
+
+    if not enable_ica:
+        return {
+            "baseline": baseline_data,
+            "stimulus": stimulus_data,
+            "removed_components": [],
+            "enabled": False,
+            "note": "ICA disabled by parameter.",
+        }
+
+    if not excluded:
+        return {
+            "baseline": baseline_data,
+            "stimulus": stimulus_data,
+            "removed_components": [],
+            "enabled": True,
+            "note": "ICA enabled, but no components were excluded.",
+        }
+
+    try:
+        from sklearn.decomposition import FastICA
+    except ImportError as exc:
+        raise ImportError(
+            "ICA artifact removal requires scikit-learn. "
+            "Install project dependencies with: pip install -r requirements.txt"
+        ) from exc
+
+    combined = np.concatenate([baseline_data, stimulus_data], axis=-1)
+    trial_count, channel_count, sample_count = combined.shape
+    component_count = min(n_components or channel_count, channel_count)
+    flattened = combined.transpose(0, 2, 1).reshape(-1, channel_count)
+
+    ica = FastICA(
+        n_components=component_count,
+        random_state=random_state,
+        whiten="unit-variance",
+        max_iter=300,
+        tol=0.001,
+    )
+    sources = ica.fit_transform(flattened)
+    valid_excluded = [
+        component for component in excluded if 0 <= component < sources.shape[1]
+    ]
+    sources[:, valid_excluded] = 0.0
+    reconstructed = ica.inverse_transform(sources)
+    reconstructed = reconstructed.reshape(trial_count, sample_count, channel_count)
+    reconstructed = reconstructed.transpose(0, 2, 1).astype("float32")
+
+    baseline_samples = baseline_data.shape[-1]
+    return {
+        "baseline": reconstructed[:, :, :baseline_samples],
+        "stimulus": reconstructed[:, :, baseline_samples:],
+        "removed_components": valid_excluded,
+        "enabled": True,
+        "note": "Manual ICA component exclusion was applied.",
+    }
+
+
+def baseline_correction(filtered_baseline, filtered_stimulus):
     """Subtract each trial/channel baseline mean from the stimulus segment."""
     baseline_mean = filtered_baseline.mean(axis=-1, keepdims=True)
     return (filtered_stimulus - baseline_mean).astype("float32")
 
 
-def run_basic_preprocessing_on_standardized_trials(standardized: dict) -> dict:
+def baseline_correct_stimulus(filtered_baseline, filtered_stimulus):
+    """Backward-compatible wrapper for baseline correction."""
+    return baseline_correction(filtered_baseline, filtered_stimulus)
+
+
+def run_basic_preprocessing_on_standardized_trials(
+    standardized: dict,
+    enable_ica: bool = False,
+    ica_n_components: int | None = DEFAULT_ICA_COMPONENTS,
+    ica_random_state: int = DEFAULT_ICA_RANDOM_STATE,
+    ica_exclude_components: list[int] | tuple[int, ...] | None = None,
+) -> dict:
     """Run the minimal baseline preprocessing chain on fixed-length raw trials.
 
     Steps:
     1. Convert fixed-length raw digital samples to NumPy arrays.
     2. Apply 4-45 Hz bandpass filtering to baseline and stimulus.
     3. Apply 50 Hz notch filtering to the bandpass-filtered data.
-    4. Correct stimulus by subtracting the filtered baseline mean.
+    4. Optionally remove manually selected ICA components.
+    5. Correct stimulus by subtracting the filtered baseline mean.
     """
     raw_baseline = _segments_to_numpy(standardized["trials"], "baseline")
     raw_stimulus = _segments_to_numpy(standardized["trials"], "stimulus")
     sampling_rate = standardized["sampling_rate"]
 
-    bandpassed_baseline = bandpass_filter_eeg(raw_baseline, sampling_rate)
-    bandpassed_stimulus = bandpass_filter_eeg(raw_stimulus, sampling_rate)
-    filtered_baseline = notch_filter_eeg(bandpassed_baseline, sampling_rate)
-    filtered_stimulus = notch_filter_eeg(bandpassed_stimulus, sampling_rate)
-    corrected_stimulus = baseline_correct_stimulus(
-        filtered_baseline,
-        filtered_stimulus,
+    filtered = bandpass_and_notch_filter(
+        raw_baseline,
+        raw_stimulus,
+        sampling_rate=sampling_rate,
+    )
+    ica_result = run_ica_artifact_removal(
+        filtered["filtered_baseline"],
+        filtered["filtered_stimulus"],
+        enable_ica=enable_ica,
+        n_components=ica_n_components,
+        random_state=ica_random_state,
+        exclude_components=ica_exclude_components,
+    )
+    corrected_stimulus = baseline_correction(
+        ica_result["baseline"],
+        ica_result["stimulus"],
     )
 
     return {
@@ -591,10 +781,139 @@ def run_basic_preprocessing_on_standardized_trials(standardized: dict) -> dict:
         },
         "raw_fixed_baseline": raw_baseline,
         "raw_fixed_stimulus": raw_stimulus,
-        "filtered_baseline": filtered_baseline,
-        "filtered_stimulus": filtered_stimulus,
+        "filtered_baseline": filtered["filtered_baseline"],
+        "filtered_stimulus": filtered["filtered_stimulus"],
+        "ica_baseline": ica_result["baseline"],
+        "ica_stimulus": ica_result["stimulus"],
+        "ica_info": {
+            "enabled": ica_result["enabled"],
+            "n_components": ica_n_components,
+            "random_state": ica_random_state,
+            "removed_components": ica_result["removed_components"],
+            "note": ica_result["note"],
+        },
         "baseline_corrected_stimulus": corrected_stimulus,
     }
+
+
+def preprocess_subject(
+    subject_id: int = 1,
+    enable_ica: bool = False,
+    ica_n_components: int | None = DEFAULT_ICA_COMPONENTS,
+    ica_random_state: int = DEFAULT_ICA_RANDOM_STATE,
+    ica_exclude_components: list[int] | tuple[int, ...] | None = None,
+) -> dict:
+    """Run the complete task-1 EEG preprocessing pipeline for one subject."""
+    subject = load_bdf_subject(subject_id)
+    extracted = extract_raw_eeg_trials_from_bdf(subject["bdf_path"])
+    fixed = fix_trial_length(extracted)
+    preprocessed = run_basic_preprocessing_on_standardized_trials(
+        fixed,
+        enable_ica=enable_ica,
+        ica_n_components=ica_n_components,
+        ica_random_state=ica_random_state,
+        ica_exclude_components=ica_exclude_components,
+    )
+    return {
+        "subject_id": subject_id,
+        "bdf_path": subject["bdf_path"],
+        "header": subject["header"],
+        "raw_trials": extracted,
+        "fixed_trials": fixed,
+        **preprocessed,
+    }
+
+
+def _get_matplotlib_pyplot():
+    PREPROCESSING_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(PREPROCESSING_RESULTS_DIR / "mpl_cache"))
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise ImportError(
+            "Preprocessing visualization requires matplotlib. "
+            "Install project dependencies with: pip install -r requirements.txt"
+        ) from exc
+    return plt
+
+
+def _plot_signal_comparison(
+    before,
+    after,
+    title: str,
+    before_label: str,
+    after_label: str,
+    output_path: Path,
+    sampling_rate: float = DEAP_SAMPLING_RATE,
+    max_seconds: float = 5.0,
+) -> Path:
+    """Save a small first-trial/first-channel signal comparison plot."""
+    plt = _get_matplotlib_pyplot()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    max_samples = min(int(max_seconds * sampling_rate), before.shape[-1], after.shape[-1])
+    time_axis = [sample / sampling_rate for sample in range(max_samples)]
+
+    figure, axis = plt.subplots(figsize=(9, 4))
+    axis.plot(time_axis, before[0, 0, :max_samples], label=before_label, linewidth=1.0)
+    axis.plot(time_axis, after[0, 0, :max_samples], label=after_label, linewidth=1.0)
+    axis.set_title(title)
+    axis.set_xlabel("Time (s)")
+    axis.set_ylabel("Amplitude")
+    axis.legend()
+    axis.grid(True, linestyle="--", alpha=0.3)
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=150)
+    plt.close(figure)
+    return output_path
+
+
+def save_raw_vs_filtered_plot(preprocessed: dict) -> Path:
+    """Save raw stimulus vs bandpass+notch filtered stimulus comparison."""
+    return _plot_signal_comparison(
+        preprocessed["raw_fixed_stimulus"],
+        preprocessed["filtered_stimulus"],
+        "Raw vs Filtered EEG Stimulus, s01",
+        "raw",
+        "bandpass + notch",
+        PREPROCESSING_RESULTS_DIR / "s01_raw_vs_filtered.png",
+        sampling_rate=preprocessed["sampling_rate"],
+    )
+
+
+def save_ica_before_after_plot(preprocessed: dict) -> Path:
+    """Save filtered stimulus vs ICA-output stimulus comparison."""
+    return _plot_signal_comparison(
+        preprocessed["filtered_stimulus"],
+        preprocessed["ica_stimulus"],
+        "ICA Before vs After EEG Stimulus, s01",
+        "before ICA",
+        "after ICA",
+        PREPROCESSING_RESULTS_DIR / "s01_ica_before_after.png",
+        sampling_rate=preprocessed["sampling_rate"],
+    )
+
+
+def save_baseline_correction_plot(preprocessed: dict) -> Path:
+    """Save stimulus before vs after baseline correction comparison."""
+    return _plot_signal_comparison(
+        preprocessed["ica_stimulus"],
+        preprocessed["baseline_corrected_stimulus"],
+        "Baseline Correction Before vs After, s01",
+        "before correction",
+        "after correction",
+        PREPROCESSING_RESULTS_DIR / "s01_baseline_correction_before_after.png",
+        sampling_rate=preprocessed["sampling_rate"],
+    )
+
+
+def save_preprocessing_visualizations(preprocessed: dict) -> list[Path]:
+    """Save the three minimal preprocessing figures required for task 1."""
+    return [
+        save_raw_vs_filtered_plot(preprocessed),
+        save_ica_before_after_plot(preprocessed),
+        save_baseline_correction_plot(preprocessed),
+    ]
 
 
 def summarize_subject_trial_boundaries(subject_id: int) -> dict:
@@ -941,18 +1260,68 @@ def print_basic_preprocessing_report(subject_id: int = 1) -> None:
     )
 
 
+def smoke_test_preprocess_subject(subject_id: int = 1) -> dict:
+    """Run a minimal s01 preprocessing smoke test and print step shapes."""
+    subject = load_bdf_subject(subject_id)
+    status_trials = extract_trials_from_status(subject["bdf_path"])
+    extracted = extract_raw_eeg_trials_from_bdf(subject["bdf_path"])
+    fixed = fix_trial_length(extracted)
+    preprocessed = run_basic_preprocessing_on_standardized_trials(
+        fixed,
+        enable_ica=False,
+    )
+    figure_paths = save_preprocessing_visualizations(preprocessed)
+
+    print("DEAP preprocessing smoke test")
+    print(f"subject: s{subject_id:02d}")
+    print(f"file name: {subject['bdf_path'].name}")
+    print(f"trial boundaries: {len(status_trials['boundaries'])}")
+    print(f"raw baseline first-trial shape: {len(extracted['trials'][0]['baseline'])}, "
+          f"{len(extracted['trials'][0]['baseline'][0])}")
+    print(f"raw stimulus first-trial shape: {len(extracted['trials'][0]['stimulus'])}, "
+          f"{len(extracted['trials'][0]['stimulus'][0])}")
+    print(f"fixed baseline shape: {fixed['baseline_shape']}")
+    print(f"fixed stimulus shape: {fixed['stimulus_shape']}")
+    print(f"raw fixed baseline shape: {preprocessed['raw_fixed_baseline'].shape}")
+    print(f"raw fixed stimulus shape: {preprocessed['raw_fixed_stimulus'].shape}")
+    print(f"filtered baseline shape: {preprocessed['filtered_baseline'].shape}")
+    print(f"filtered stimulus shape: {preprocessed['filtered_stimulus'].shape}")
+    print(f"ICA baseline shape: {preprocessed['ica_baseline'].shape}")
+    print(f"ICA stimulus shape: {preprocessed['ica_stimulus'].shape}")
+    print(f"ICA enabled: {preprocessed['ica_info']['enabled']}")
+    print(f"ICA removed components: {preprocessed['ica_info']['removed_components']}")
+    print(
+        "baseline-corrected stimulus shape: "
+        f"{preprocessed['baseline_corrected_stimulus'].shape}"
+    )
+    print("saved preprocessing figures:")
+    for figure_path in figure_paths:
+        print(f"  {figure_path}")
+
+    expected_shape = (
+        EXPECTED_DEAP_TRIAL_COUNT,
+        EEG_CHANNEL_COUNT,
+        TARGET_STIMULUS_SAMPLES,
+    )
+    if preprocessed["baseline_corrected_stimulus"].shape != expected_shape:
+        raise ValueError(
+            "Unexpected final stimulus shape: "
+            f"{preprocessed['baseline_corrected_stimulus'].shape}, "
+            f"expected {expected_shape}."
+        )
+
+    return {
+        "subject": subject,
+        "status_trials": status_trials,
+        "raw_trials": extracted,
+        "fixed_trials": fixed,
+        "preprocessed": preprocessed,
+        "figure_paths": figure_paths,
+    }
+
+
 def main() -> None:
-    print_subject_raw_report(subject_id=1)
-    print()
-    print_subject_event_report(subject_id=1)
-    print()
-    print_multi_subject_consistency_report(subject_ids=(1, 2, 3))
-    print()
-    print_raw_eeg_trial_extraction_report(subject_id=1)
-    print()
-    print_standardized_trial_length_report(subject_id=1)
-    print()
-    print_basic_preprocessing_report(subject_id=1)
+    smoke_test_preprocess_subject(subject_id=1)
 
 
 if __name__ == "__main__":
