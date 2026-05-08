@@ -3,7 +3,6 @@ __pycache__/
 .venv/
 data/
 results/
-__pycache__/
 *.pyc
 # DEAP official preprocessed data
 *.dat

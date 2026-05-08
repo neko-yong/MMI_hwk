@@ -49,6 +49,11 @@ DEFAULT_ICA_RANDOM_STATE = 42
 PREPROCESSING_RESULTS_DIR = Path("results/preprocessing")
 ICA_DEBUG_RESULTS_DIR = Path("results/preprocessing_ica_debug")
 DEFAULT_ICA_DEBUG_EXCLUDE_SETS = ((), (0,), (1,), (0, 1))
+OFFICIAL_LIKE_SAMPLING_RATE = 128
+OFFICIAL_LIKE_BASELINE_SECONDS = 3
+OFFICIAL_LIKE_CHANNEL_COUNT = 40
+OFFICIAL_LIKE_PERIPHERAL_CHANNEL_COUNT = 8
+OFFICIAL_LIKE_LABEL_COLUMNS = ("Valence", "Arousal", "Dominance", "Liking")
 
 
 def preprocess_eeg(eeg_data):
@@ -475,6 +480,65 @@ def _read_eeg_interval(
                 raw_channel = file.read(eeg_channel_bytes)
                 _append_signed_int24_samples(
                     channel_data[channel_index],
+                    raw_channel,
+                    local_start,
+                    local_end,
+                )
+
+    return channel_data
+
+
+def _read_channels_interval(
+    bdf_path: str | Path,
+    header: dict,
+    start_sample: int,
+    end_sample: int,
+    channel_indices: list[int],
+) -> list[array]:
+    """Read raw digital samples for selected BDF channels.
+
+    This helper is used only by the optional official-like output branch. It
+    keeps the stable first-32-EEG preprocessing path untouched.
+    """
+    path = Path(bdf_path)
+    samples_per_record = header["samples_per_record"]
+    reference_samples_per_record = samples_per_record[channel_indices[0]]
+
+    for channel_index in channel_indices:
+        if samples_per_record[channel_index] != reference_samples_per_record:
+            raise ValueError(
+                "Selected official-like channels have inconsistent sampling "
+                "rates; official_like_data cannot be built reliably."
+            )
+
+    first_record = start_sample // reference_samples_per_record
+    last_record = (end_sample - 1) // reference_samples_per_record
+    record_bytes = sum(samples_per_record) * 3
+    channel_bytes_per_record = reference_samples_per_record * 3
+    channel_offsets = [
+        sum(samples_per_record[:channel_index]) * 3
+        for channel_index in channel_indices
+    ]
+    channel_data = [array("i") for _ in channel_indices]
+
+    with path.open("rb") as file:
+        for record_index in range(first_record, last_record + 1):
+            record_start_sample = record_index * reference_samples_per_record
+            local_start = max(start_sample - record_start_sample, 0)
+            local_end = min(
+                end_sample - record_start_sample,
+                reference_samples_per_record,
+            )
+
+            for output_index, channel_offset in enumerate(channel_offsets):
+                file.seek(
+                    header["header_bytes"]
+                    + record_index * record_bytes
+                    + channel_offset
+                )
+                raw_channel = file.read(channel_bytes_per_record)
+                _append_signed_int24_samples(
+                    channel_data[output_index],
                     raw_channel,
                     local_start,
                     local_end,
@@ -926,6 +990,377 @@ def baseline_correct_stimulus(filtered_baseline, filtered_stimulus):
     return baseline_correction(filtered_baseline, filtered_stimulus)
 
 
+def _target_sample_count(duration_seconds: float, sampling_rate: float) -> int:
+    """Return integer sample count for a duration/sampling-rate pair."""
+    return int(round(duration_seconds * sampling_rate))
+
+
+def _downsample_last_axis(
+    data,
+    source_sfreq: float,
+    target_sfreq: float,
+    expected_samples: int,
+    name: str,
+):
+    """Downsample with polyphase filtering and validate the final length."""
+    from math import gcd
+    from scipy.signal import resample_poly
+
+    source = int(round(source_sfreq))
+    target = int(round(target_sfreq))
+    divisor = gcd(source, target)
+    downsampled = resample_poly(
+        data,
+        up=target // divisor,
+        down=source // divisor,
+        axis=-1,
+    ).astype("float32")
+
+    if downsampled.shape[-1] != expected_samples:
+        raise ValueError(
+            f"{name} downsampled to {downsampled.shape[-1]} samples, "
+            f"expected {expected_samples} samples."
+        )
+
+    return downsampled
+
+
+def load_official_like_labels(
+    subject_id: int,
+    metadata_dir: str | Path = DEFAULT_METADATA_DIR,
+):
+    """Load Valence/Arousal/Dominance/Liking labels as a (40, 4) array."""
+    np, _, _, _, _ = _require_signal_processing_dependencies()
+    rows = load_participant_ratings(subject_id, metadata_dir)
+    rows = sorted(rows, key=lambda row: int(row["Trial"]))
+
+    if len(rows) != EXPECTED_DEAP_TRIAL_COUNT:
+        raise ValueError(
+            f"Expected {EXPECTED_DEAP_TRIAL_COUNT} ratings for s{subject_id:02d}, "
+            f"got {len(rows)}."
+        )
+
+    labels = np.asarray(
+        [
+            [float(row[column]) for column in OFFICIAL_LIKE_LABEL_COLUMNS]
+            for row in rows
+        ],
+        dtype="float32",
+    )
+    expected_shape = (
+        EXPECTED_DEAP_TRIAL_COUNT,
+        len(OFFICIAL_LIKE_LABEL_COLUMNS),
+    )
+    if labels.shape != expected_shape:
+        raise ValueError(
+            f"official_like_labels shape is {labels.shape}, "
+            f"expected {expected_shape}."
+        )
+    return labels
+
+
+def _build_official_like_baseline_corrected_eeg(
+    baseline_corrected_stimulus,
+    source_sfreq: float,
+    target_sfreq: float,
+):
+    """Return modeling-friendly baseline-corrected EEG at official-like 128 Hz."""
+    expected_samples = _target_sample_count(DEAP_TRIAL_DURATION_SECONDS, target_sfreq)
+    official_like = _downsample_last_axis(
+        baseline_corrected_stimulus,
+        source_sfreq,
+        target_sfreq,
+        expected_samples,
+        "official_like_baseline_corrected_eeg",
+    )
+    expected_shape = (
+        EXPECTED_DEAP_TRIAL_COUNT,
+        EEG_CHANNEL_COUNT,
+        expected_samples,
+    )
+    if official_like.shape != expected_shape:
+        raise ValueError(
+            "official_like_baseline_corrected_eeg shape is "
+            f"{official_like.shape}, expected {expected_shape}."
+        )
+    return official_like
+
+
+def _build_official_like_eeg_window(
+    preprocessed: dict,
+    source_sfreq: float,
+    target_sfreq: float,
+):
+    """Build first-32 EEG channels as 3s baseline + 60s stimulus at target Hz."""
+    baseline_source_samples = _target_sample_count(
+        OFFICIAL_LIKE_BASELINE_SECONDS,
+        source_sfreq,
+    )
+    baseline_target_samples = _target_sample_count(
+        OFFICIAL_LIKE_BASELINE_SECONDS,
+        target_sfreq,
+    )
+    stimulus_target_samples = _target_sample_count(
+        DEAP_TRIAL_DURATION_SECONDS,
+        target_sfreq,
+    )
+
+    baseline = preprocessed["ica_baseline"][:, :, -baseline_source_samples:]
+    stimulus = preprocessed["ica_stimulus"]
+    baseline_128 = _downsample_last_axis(
+        baseline,
+        source_sfreq,
+        target_sfreq,
+        baseline_target_samples,
+        "official_like_eeg_baseline",
+    )
+    stimulus_128 = _downsample_last_axis(
+        stimulus,
+        source_sfreq,
+        target_sfreq,
+        stimulus_target_samples,
+        "official_like_eeg_stimulus",
+    )
+    return preprocessed_array_concatenate((baseline_128, stimulus_128), axis=-1)
+
+
+def preprocessed_array_concatenate(arrays, axis: int = -1):
+    """Small NumPy wrapper to keep NumPy as a lazy preprocessing dependency."""
+    np, _, _, _, _ = _require_signal_processing_dependencies()
+    return np.concatenate(arrays, axis=axis).astype("float32")
+
+
+def _build_official_like_peripheral_window(
+    bdf_path: Path,
+    header: dict,
+    fixed: dict,
+    source_sfreq: float,
+    target_sfreq: float,
+):
+    """Build real EXG/peripheral channels for optional official-like output.
+
+    The first 32 EEG channels use the project EEG preprocessing chain. These
+    8 channels are read from the raw BDF and resampled to match the official
+    3s+60s layout. They are real channel data, not zero placeholders, but they
+    are not claimed to reproduce DEAP's undisclosed peripheral preprocessing.
+    """
+    np, _, _, _, _ = _require_signal_processing_dependencies()
+    if header["num_signals"] < OFFICIAL_LIKE_CHANNEL_COUNT:
+        raise ValueError(
+            f"BDF has {header['num_signals']} channels; cannot read first "
+            f"{OFFICIAL_LIKE_CHANNEL_COUNT} channels for official_like_data."
+        )
+
+    peripheral_indices = list(
+        range(
+            EEG_CHANNEL_COUNT,
+            EEG_CHANNEL_COUNT + OFFICIAL_LIKE_PERIPHERAL_CHANNEL_COUNT,
+        )
+    )
+    for channel_index in peripheral_indices:
+        channel_sfreq = float(header["sampling_rates"][channel_index])
+        if abs(channel_sfreq - source_sfreq) > 1e-6:
+            raise ValueError(
+                "Peripheral channel sampling rate mismatch: "
+                f"channel {channel_index} is {channel_sfreq} Hz, "
+                f"expected {source_sfreq} Hz."
+            )
+
+    baseline_source_samples = _target_sample_count(
+        OFFICIAL_LIKE_BASELINE_SECONDS,
+        source_sfreq,
+    )
+    stimulus_source_samples = _target_sample_count(
+        DEAP_TRIAL_DURATION_SECONDS,
+        source_sfreq,
+    )
+    baseline_target_samples = _target_sample_count(
+        OFFICIAL_LIKE_BASELINE_SECONDS,
+        target_sfreq,
+    )
+    stimulus_target_samples = _target_sample_count(
+        DEAP_TRIAL_DURATION_SECONDS,
+        target_sfreq,
+    )
+
+    warnings: list[str] = []
+    trial_windows = []
+    for trial in fixed["trials"]:
+        boundary = trial["boundary"]
+        stimulus_start = boundary["stimulus_start_sample"]
+        baseline_start = max(
+            boundary["baseline_start_sample"],
+            stimulus_start - baseline_source_samples,
+        )
+        stimulus_end = min(
+            boundary["stimulus_end_sample"],
+            stimulus_start + stimulus_source_samples,
+        )
+
+        baseline_channels = _read_channels_interval(
+            bdf_path,
+            header,
+            baseline_start,
+            stimulus_start,
+            peripheral_indices,
+        )
+        stimulus_channels = _read_channels_interval(
+            bdf_path,
+            header,
+            stimulus_start,
+            stimulus_end,
+            peripheral_indices,
+        )
+        fixed_baseline = [
+            _crop_or_pad_channel(
+                channel,
+                baseline_source_samples,
+                trial["trial"],
+                "official_like_peripheral_baseline",
+                output_index,
+                warnings,
+            )
+            for output_index, channel in enumerate(baseline_channels)
+        ]
+        fixed_stimulus = [
+            _crop_or_pad_channel(
+                channel,
+                stimulus_source_samples,
+                trial["trial"],
+                "official_like_peripheral_stimulus",
+                output_index,
+                warnings,
+            )
+            for output_index, channel in enumerate(stimulus_channels)
+        ]
+        baseline = np.asarray([list(channel) for channel in fixed_baseline], dtype="float32")
+        stimulus = np.asarray([list(channel) for channel in fixed_stimulus], dtype="float32")
+        baseline_128 = _downsample_last_axis(
+            baseline,
+            source_sfreq,
+            target_sfreq,
+            baseline_target_samples,
+            "official_like_peripheral_baseline",
+        )
+        stimulus_128 = _downsample_last_axis(
+            stimulus,
+            source_sfreq,
+            target_sfreq,
+            stimulus_target_samples,
+            "official_like_peripheral_stimulus",
+        )
+        trial_windows.append(
+            preprocessed_array_concatenate((baseline_128, stimulus_128), axis=-1)
+        )
+
+    return np.asarray(trial_windows, dtype="float32"), warnings
+
+
+def _build_official_like_outputs(
+    subject_id: int,
+    subject: dict,
+    fixed: dict,
+    preprocessed: dict,
+    official_like_sfreq: float,
+    include_official_like_data: bool,
+) -> dict:
+    """Build optional official .dat-style outputs without changing defaults."""
+    source_sfreq = float(preprocessed["sampling_rate"])
+    labels = load_official_like_labels(subject_id)
+    baseline_corrected_eeg = _build_official_like_baseline_corrected_eeg(
+        preprocessed["baseline_corrected_stimulus"],
+        source_sfreq,
+        official_like_sfreq,
+    )
+
+    eeg_window = _build_official_like_eeg_window(
+        preprocessed,
+        source_sfreq,
+        official_like_sfreq,
+    )
+    official_like_data = None
+    official_like_data_reason = "include_official_like_data=False"
+    peripheral_warnings: list[str] = []
+    channel_names = list(subject["header"]["channel_labels"][:EEG_CHANNEL_COUNT])
+
+    if include_official_like_data:
+        try:
+            peripheral_window, peripheral_warnings = _build_official_like_peripheral_window(
+                subject["bdf_path"],
+                subject["header"],
+                fixed,
+                source_sfreq,
+                official_like_sfreq,
+            )
+            official_like_data = preprocessed_array_concatenate(
+                (eeg_window, peripheral_window),
+                axis=1,
+            )
+            channel_names = list(
+                subject["header"]["channel_labels"][:OFFICIAL_LIKE_CHANNEL_COUNT]
+            )
+            expected_shape = (
+                EXPECTED_DEAP_TRIAL_COUNT,
+                OFFICIAL_LIKE_CHANNEL_COUNT,
+                _target_sample_count(
+                    OFFICIAL_LIKE_BASELINE_SECONDS + DEAP_TRIAL_DURATION_SECONDS,
+                    official_like_sfreq,
+                ),
+            )
+            if official_like_data.shape != expected_shape:
+                raise ValueError(
+                    f"official_like_data shape is {official_like_data.shape}, "
+                    f"expected {expected_shape}."
+                )
+            official_like_data_reason = (
+                "constructed from project-preprocessed EEG channels plus real "
+                "raw BDF channels 32-39 resampled to official-like timing"
+            )
+        except Exception as exc:
+            official_like_data = None
+            official_like_data_reason = (
+                "official_like_data unavailable because real peripheral "
+                f"channels could not be constructed reliably: {exc}"
+            )
+
+    preprocessing_info = {
+        "original_sampling_rate": source_sfreq,
+        "official_like_sampling_rate": official_like_sfreq,
+        "official_like_data_shape": (
+            None if official_like_data is None else tuple(official_like_data.shape)
+        ),
+        "official_like_baseline_corrected_eeg_shape": tuple(
+            baseline_corrected_eeg.shape
+        ),
+        "official_like_labels_shape": tuple(labels.shape),
+        "official_like_channel_names": channel_names,
+        "official_like_label_columns": OFFICIAL_LIKE_LABEL_COLUMNS,
+        "official_like_is_official_dat_exact_copy": False,
+        "official_like_note": (
+            "Official-like structure generated from project preprocessing "
+            "pipeline; not an exact official .dat copy."
+        ),
+        "official_like_data_reason": official_like_data_reason,
+        "official_like_peripheral_note": (
+            "If official_like_data is available, channels 0-31 are EEG from "
+            "the project preprocessing chain; channels 32-39 are real BDF "
+            "auxiliary/peripheral channels resampled for structural "
+            "compatibility, not a claimed reproduction of DEAP's private "
+            "peripheral preprocessing."
+        ),
+        "official_like_peripheral_warnings": peripheral_warnings,
+        "ica_default_strategy": "no automatic component deletion",
+    }
+
+    return {
+        "official_like_baseline_corrected_eeg": baseline_corrected_eeg,
+        "official_like_data": official_like_data,
+        "official_like_labels": labels,
+        "official_like_sampling_rate": official_like_sfreq,
+        "preprocessing_info": preprocessing_info,
+    }
+
+
 def run_basic_preprocessing_on_standardized_trials(
     standardized: dict,
     enable_ica: bool = False,
@@ -1005,8 +1440,16 @@ def preprocess_subject(
     ica_n_components: int | None = DEFAULT_ICA_COMPONENTS,
     ica_random_state: int = DEFAULT_ICA_RANDOM_STATE,
     ica_exclude_components: list[int] | tuple[int, ...] | None = None,
+    output_official_like: bool = False,
+    official_like_sfreq: float = OFFICIAL_LIKE_SAMPLING_RATE,
+    include_official_like_data: bool = True,
 ) -> dict:
-    """Run the complete task-1 EEG preprocessing pipeline for one subject."""
+    """Run the complete task-1 EEG preprocessing pipeline for one subject.
+
+    By default, the returned fields stay backward-compatible with earlier
+    project code. Set output_official_like=True to add optional DEAP official
+    .dat-style outputs without changing the stable baseline preprocessing.
+    """
     ica_enabled = enable_ica if use_ica is None else use_ica
     subject = load_bdf_subject(subject_id)
     extracted = extract_raw_eeg_trials_from_bdf(subject["bdf_path"])
@@ -1018,7 +1461,7 @@ def preprocess_subject(
         ica_random_state=ica_random_state,
         ica_exclude_components=ica_exclude_components,
     )
-    return {
+    result = {
         "subject_id": subject_id,
         "bdf_path": subject["bdf_path"],
         "header": subject["header"],
@@ -1026,6 +1469,20 @@ def preprocess_subject(
         "fixed_trials": fixed,
         **preprocessed,
     }
+
+    if output_official_like:
+        result.update(
+            _build_official_like_outputs(
+                subject_id,
+                subject,
+                fixed,
+                preprocessed,
+                official_like_sfreq,
+                include_official_like_data,
+            )
+        )
+
+    return result
 
 
 def _get_matplotlib_pyplot():
